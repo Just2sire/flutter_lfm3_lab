@@ -1,9 +1,18 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import 'conversation.dart';
+import 'conversation_drawer.dart';
+import 'conversation_store.dart';
 import 'lfm3_engine.dart';
+
+enum _ChatMenuAction { share, rename, newChat, about }
 
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key, required this.onModelInvalid});
@@ -14,45 +23,73 @@ class ChatPage extends StatefulWidget {
   State<ChatPage> createState() => _ChatPageState();
 }
 
-class _ChatMessage {
-  _ChatMessage({required this.fromUser, required this.text});
-
-  final bool fromUser;
-  String text;
-}
-
 class _ChatPageState extends State<ChatPage> {
   final _engine = Lfm3Engine();
+  final _store = ConversationStore();
   final _input = TextEditingController();
   final _scroll = ScrollController();
-  final _messages = <_ChatMessage>[];
+  final _conversations = <Conversation>[];
 
+  Conversation? _active;
   late final AppLifecycleListener _lifecycle;
 
+  bool _loading = true;
   bool _loadingModel = true;
   bool _generating = false;
   bool _stopRequested = false;
   bool _enableThinking = false;
+  bool _showScrollButton = false;
   String? _loadError;
   String? _generationError;
   String _streamingText = '';
+  DateTime? _streamStartedAt;
 
   @override
   void initState() {
     super.initState();
     _lifecycle = AppLifecycleListener(onStateChange: _onLifecycle);
-    _loadModel();
+    _scroll.addListener(_onScroll);
+    _bootstrap();
   }
 
   @override
   void dispose() {
     _lifecycle.dispose();
+    _scroll.removeListener(_onScroll);
     _engine.stop();
     unawaited(_engine.dispose());
     _input.dispose();
     _scroll.dispose();
     super.dispose();
   }
+
+  Future<void> _bootstrap() async {
+    final state = await _store.load();
+    if (!mounted) return;
+
+    setState(() {
+      _conversations
+        ..clear()
+        ..addAll(state.conversations);
+      if (_conversations.isEmpty) {
+        _conversations.add(Conversation.empty());
+      }
+      _active = _conversations.firstWhere(
+        (conversation) => conversation.id == state.activeId,
+        orElse: () => _conversations.first,
+      );
+      _loading = false;
+    });
+
+    unawaited(_persist());
+    await _loadModel(withHistory: _historyOf(_active).isNotEmpty);
+  }
+
+  List<ChatTurn> _historyOf(Conversation? conversation) => [
+    if (conversation != null)
+      for (final message in conversation.messages)
+        ChatTurn(fromUser: message.fromUser, text: message.text),
+  ];
 
   Future<void> _loadModel({bool withHistory = false}) async {
     setState(() {
@@ -61,13 +98,9 @@ class _ChatPageState extends State<ChatPage> {
     });
 
     try {
-      final history = withHistory
-          ? [
-              for (final message in _messages)
-                ChatTurn(fromUser: message.fromUser, text: message.text),
-            ]
-          : const <ChatTurn>[];
-      await _engine.load(history: history);
+      await _engine.load(
+        history: withHistory ? _historyOf(_active) : const <ChatTurn>[],
+      );
       if (!mounted) return;
       setState(() => _loadingModel = false);
     } catch (error) {
@@ -82,12 +115,12 @@ class _ChatPageState extends State<ChatPage> {
   void _onLifecycle(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
-      _unloadModel();
+      unawaited(_unloadModel());
     } else if (state == AppLifecycleState.resumed &&
         !_engine.isLoaded &&
         !_loadingModel &&
         _loadError == null) {
-      unawaited(_loadModel(withHistory: _messages.isNotEmpty));
+      unawaited(_loadModel(withHistory: _historyOf(_active).isNotEmpty));
     }
   }
 
@@ -97,25 +130,90 @@ class _ChatPageState extends State<ChatPage> {
     await _engine.dispose();
   }
 
-  Future<void> _send() async {
-    final text = _input.text.trim();
-    if (text.isEmpty || _generating || _loadingModel || _loadError != null) {
+  Future<void> _persist() {
+    return _store.save(
+      ConversationState(
+        conversations: List.of(_conversations),
+        activeId: _active?.id,
+      ),
+    );
+  }
+
+  Future<void> _send([String? preset]) async {
+    final text = (preset ?? _input.text).trim();
+    final conversation = _active;
+    if (text.isEmpty ||
+        conversation == null ||
+        _generating ||
+        _loadingModel ||
+        _loadError != null) {
       return;
     }
 
     _input.clear();
     setState(() {
-      _messages.add(_ChatMessage(fromUser: true, text: text));
+      conversation.messages.add(ChatMessage.user(text));
+      if (conversation.title == Conversation.defaultTitle) {
+        conversation.title = _titleFrom(text);
+      }
+      conversation.updatedAt = DateTime.now();
+      _generationError = null;
+    });
+    unawaited(_persist());
+    _scrollToBottom(force: true);
+
+    await _runGeneration(conversation, text);
+  }
+
+  Future<void> _regenerate() async {
+    final conversation = _active;
+    if (conversation == null ||
+        conversation.messages.isEmpty ||
+        _generating ||
+        _loadingModel ||
+        _loadError != null) {
+      return;
+    }
+
+    final messages = conversation.messages;
+    final lastUserIndex = messages.lastIndexWhere(
+      (message) => message.fromUser,
+    );
+    if (lastUserIndex < 0) return;
+
+    if (lastUserIndex < messages.length - 1) {
+      messages.removeRange(lastUserIndex + 1, messages.length);
+    }
+
+    final prompt = messages[lastUserIndex].text;
+    final history = <ChatTurn>[
+      for (var i = 0; i < lastUserIndex; i++)
+        ChatTurn(fromUser: messages[i].fromUser, text: messages[i].text),
+    ];
+
+    setState(() {
+      conversation.updatedAt = DateTime.now();
+      _generationError = null;
+    });
+    _engine.setHistory(history);
+    unawaited(_persist());
+
+    await _runGeneration(conversation, prompt);
+  }
+
+  Future<void> _runGeneration(Conversation conversation, String prompt) async {
+    setState(() {
       _generating = true;
       _stopRequested = false;
       _generationError = null;
       _streamingText = '';
+      _streamStartedAt = DateTime.now();
     });
-    _scrollToBottom();
+    _scrollToBottom(force: true);
 
     try {
       await for (final chunk in _engine.chat(
-        text,
+        prompt,
         enableThinking: _enableThinking,
       )) {
         if (!mounted) return;
@@ -125,20 +223,32 @@ class _ChatPageState extends State<ChatPage> {
 
       if (!mounted) return;
       final reply = _streamingText.trim();
+      final startedAt = _streamStartedAt;
+      final elapsedMs = startedAt == null
+          ? null
+          : DateTime.now().difference(startedAt).inMilliseconds;
+
       setState(() {
         if (reply.isNotEmpty) {
-          _messages.add(_ChatMessage(fromUser: false, text: reply));
+          conversation.messages.add(
+            ChatMessage.assistant(reply, elapsedMs: elapsedMs),
+          );
+          conversation.updatedAt = DateTime.now();
         }
         _generating = false;
         _stopRequested = false;
         _streamingText = '';
+        _streamStartedAt = null;
       });
+      unawaited(_persist());
+      if (reply.isNotEmpty) _scrollToBottom();
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _generating = false;
         _stopRequested = false;
         _streamingText = '';
+        _streamStartedAt = null;
         _generationError = _friendlyError(error);
       });
     }
@@ -151,26 +261,223 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _newConversation() {
+    final active = _active;
+    if (active != null && active.messages.isEmpty) return;
+
     _engine.stop();
-    _engine.reset();
+    final conversation = Conversation.empty();
     setState(() {
-      _messages.clear();
+      _conversations.add(conversation);
+      _active = conversation;
       _streamingText = '';
       _generationError = null;
       _stopRequested = false;
       _generating = false;
+      _streamStartedAt = null;
     });
+    if (_engine.isLoaded) _engine.setHistory(const <ChatTurn>[]);
+    unawaited(_persist());
   }
 
-  void _scrollToBottom() {
+  void _selectConversation(Conversation conversation) {
+    if (conversation.id == _active?.id) {
+      Navigator.of(context).maybePop();
+      return;
+    }
+
+    _engine.stop();
+    setState(() {
+      _active = conversation;
+      _streamingText = '';
+      _generationError = null;
+      _stopRequested = false;
+      _generating = false;
+      _streamStartedAt = null;
+    });
+    if (_engine.isLoaded) _engine.setHistory(_historyOf(conversation));
+    unawaited(_persist());
+    _scrollToBottom(force: true);
+    Navigator.of(context).maybePop();
+  }
+
+  Future<void> _renameConversation(Conversation conversation) async {
+    final controller = TextEditingController(text: conversation.title);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Renommer la conversation'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 60,
+          textInputAction: TextInputAction.done,
+          onSubmitted: (value) => Navigator.of(context).pop(value),
+          decoration: const InputDecoration(hintText: 'Titre'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Renommer'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (!mounted) return;
+    final title = result?.trim();
+    if (title == null || title.isEmpty) return;
+
+    setState(() {
+      conversation.title = title;
+      conversation.updatedAt = DateTime.now();
+    });
+    unawaited(_persist());
+  }
+
+  Future<void> _deleteConversation(Conversation conversation) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Supprimer la conversation ?'),
+        content: Text(
+          '« ${conversation.title} » et ses messages seront définitivement '
+          'supprimés de cet appareil.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Supprimer'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    _engine.stop();
+    setState(() {
+      _conversations.removeWhere((item) => item.id == conversation.id);
+      if (_active?.id == conversation.id) {
+        if (_conversations.isEmpty) {
+          _conversations.add(Conversation.empty());
+        }
+        _active = _conversations.first;
+        _streamingText = '';
+        _generationError = null;
+        _stopRequested = false;
+        _generating = false;
+        _streamStartedAt = null;
+      }
+    });
+    if (_engine.isLoaded) _engine.setHistory(_historyOf(_active));
+    unawaited(_persist());
+  }
+
+  void _deleteMessage(ChatMessage message) {
+    final conversation = _active;
+    if (conversation == null || _generating) return;
+
+    setState(() {
+      conversation.messages.removeWhere((item) => item.id == message.id);
+      conversation.updatedAt = DateTime.now();
+    });
+    if (_engine.isLoaded) _engine.setHistory(_historyOf(conversation));
+    unawaited(_persist());
+  }
+
+  Future<void> _copyText(String text, {String label = 'Copié'}) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    _showSnack(label);
+  }
+
+  Future<void> _share(String text, {String? subject}) async {
+    if (text.trim().isEmpty) return;
+    try {
+      await SharePlus.instance.share(
+        ShareParams(text: text, subject: subject, title: subject),
+      );
+    } catch (_) {
+      await _copyText(text, label: 'Partage indisponible, texte copié');
+    }
+  }
+
+  Future<void> _shareConversation(Conversation conversation) async {
+    if (conversation.messages.isEmpty) return;
+    await _share(_transcript(conversation), subject: conversation.title);
+  }
+
+  Future<void> _openLink(String url, String title) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    try {
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!launched && mounted) _showSnack('Impossible d’ouvrir le lien');
+    } catch (_) {
+      if (mounted) _showSnack('Impossible d’ouvrir le lien');
+    }
+  }
+
+  void _showSnack(String message) {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+      );
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final position = _scroll.position;
+    final show = position.pixels < position.maxScrollExtent - 160;
+    if (show != _showScrollButton) {
+      setState(() => _showScrollButton = show);
+    }
+  }
+
+  void _scrollToBottom({bool force = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
+      if (!force && _showScrollButton) return;
       _scroll.animateTo(
         _scroll.position.maxScrollExtent,
         duration: const Duration(milliseconds: 200),
         curve: Curves.easeOut,
       );
     });
+  }
+
+  String _titleFrom(String text) {
+    final single = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (single.isEmpty) return Conversation.defaultTitle;
+    return single.length > 48 ? '${single.substring(0, 48)}…' : single;
+  }
+
+  String _transcript(Conversation conversation) {
+    final buffer = StringBuffer()
+      ..writeln(conversation.title)
+      ..writeln();
+    for (final message in conversation.messages) {
+      buffer.writeln(message.fromUser ? 'Vous :' : 'LFM3 :');
+      buffer.writeln(message.text);
+      buffer.writeln();
+    }
+    buffer.writeln('— LFM3-1.7B · 100 % local');
+    return buffer.toString().trim();
   }
 
   String _friendlyError(Object error) {
@@ -198,93 +505,212 @@ class _ChatPageState extends State<ChatPage> {
     if (_loadError != null) {
       return _ErrorView(
         message: _loadError!,
-        onRetry: () => _loadModel(withHistory: _messages.isNotEmpty),
+        onRetry: () => _loadModel(withHistory: _historyOf(_active).isNotEmpty),
         onDeleteModel: _deleteModel,
       );
     }
 
-    if (_loadingModel) {
-      return const Scaffold(
+    if (_loading || _loadingModel) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('LFM3 · local')),
         body: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 16),
-              Text('Chargement du modèle…'),
+              const CircularProgressIndicator(),
+              const SizedBox(height: 16),
+              Text(
+                _loading
+                    ? 'Chargement des conversations…'
+                    : 'Chargement du modèle…',
+              ),
             ],
           ),
         ),
       );
     }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('LFM3 · local'),
-        actions: [
-          IconButton(
-            onPressed: () => setState(() => _enableThinking = !_enableThinking),
-            icon: Icon(
-              _enableThinking ? Icons.psychology : Icons.psychology_outlined,
+    final conversation = _active;
+    if (conversation == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final messages = conversation.messages;
+
+    return CallbackShortcuts(
+      bindings: {const SingleActivator(LogicalKeyboardKey.escape): _stop},
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(
+            conversation.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          actions: [
+            IconButton(
+              onPressed: () =>
+                  setState(() => _enableThinking = !_enableThinking),
+              icon: Icon(
+                _enableThinking ? Icons.psychology : Icons.psychology_outlined,
+              ),
+              tooltip: _enableThinking
+                  ? 'Réflexion activée'
+                  : 'Réflexion désactivée',
             ),
-            tooltip: _enableThinking
-                ? 'Réflexion activée'
-                : 'Réflexion désactivée',
-          ),
-          IconButton(
-            onPressed: _messages.isEmpty || _generating
-                ? null
-                : _newConversation,
-            icon: const Icon(Icons.delete_sweep_outlined),
-            tooltip: 'Nouvelle conversation',
-          ),
-          IconButton(
-            onPressed: _showAbout,
-            icon: const Icon(Icons.info_outline),
-            tooltip: 'À propos',
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _messages.isEmpty && !_generating
-                ? const _EmptyChat()
-                : ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _messages.length + (_generating ? 1 : 0),
-                    itemBuilder: (context, index) {
-                      if (index < _messages.length) {
-                        return _MessageBubble(message: _messages[index]);
-                      }
-                      return _MessageBubble(
-                        message: _ChatMessage(
-                          fromUser: false,
-                          text: _streamingText,
-                        ),
-                        pending: _streamingText.isEmpty,
-                        stopped: _stopRequested,
-                        streaming: true,
-                      );
-                    },
+            PopupMenuButton<_ChatMenuAction>(
+              onSelected: _onMenu,
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  value: _ChatMenuAction.share,
+                  enabled: messages.isNotEmpty,
+                  child: const ListTile(
+                    leading: Icon(Icons.ios_share_outlined),
+                    title: Text('Partager la conversation'),
+                    contentPadding: EdgeInsets.zero,
                   ),
-          ),
-          if (_generationError != null)
-            _ErrorBanner(
-              message: _generationError!,
-              onClose: () => setState(() => _generationError = null),
+                ),
+                const PopupMenuItem(
+                  value: _ChatMenuAction.rename,
+                  child: ListTile(
+                    leading: Icon(Icons.edit_outlined),
+                    title: Text('Renommer'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: _ChatMenuAction.newChat,
+                  child: ListTile(
+                    leading: Icon(Icons.add_comment_outlined),
+                    title: Text('Nouveau chat'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+                const PopupMenuDivider(),
+                const PopupMenuItem(
+                  value: _ChatMenuAction.about,
+                  child: ListTile(
+                    leading: Icon(Icons.info_outline),
+                    title: Text('À propos'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              ],
             ),
-          _Composer(
-            controller: _input,
-            generating: _generating,
-            stopRequested: _stopRequested,
-            onSend: _send,
-            onStop: _stop,
-          ),
-        ],
+          ],
+        ),
+        drawer: ConversationDrawer(
+          conversations: _conversations,
+          activeId: conversation.id,
+          onNewChat: () {
+            Navigator.of(context).maybePop();
+            _newConversation();
+          },
+          onSelect: _selectConversation,
+          onRename: _renameConversation,
+          onDelete: _deleteConversation,
+          onAbout: () {
+            Navigator.of(context).maybePop();
+            _showAbout();
+          },
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                children: [
+                  if (messages.isEmpty && !_generating)
+                    _EmptyChat(onSuggestion: (prompt) => _send(prompt))
+                  else
+                    SelectionArea(
+                      child: ListView.builder(
+                        controller: _scroll,
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                        itemCount: messages.length + (_generating ? 1 : 0),
+                        itemBuilder: (context, index) {
+                          if (index < messages.length) {
+                            final message = messages[index];
+                            final isLast = index == messages.length - 1;
+                            return _MessageBubble(
+                              fromUser: message.fromUser,
+                              text: message.text,
+                              createdAt: message.createdAt,
+                              elapsedMs: message.elapsedMs,
+                              onCopy: () => _copyText(message.text),
+                              onShare: () => _share(
+                                message.text,
+                                subject: conversation.title,
+                              ),
+                              onDelete: _generating
+                                  ? null
+                                  : () => _deleteMessage(message),
+                              onRegenerate:
+                                  !_generating && !message.fromUser && isLast
+                                  ? _regenerate
+                                  : null,
+                              onLinkTap: _openLink,
+                              onCodeCopy: (code) =>
+                                  _copyText(code, label: 'Code copié'),
+                            );
+                          }
+
+                          return _MessageBubble(
+                            fromUser: false,
+                            text: _streamingText,
+                            pending: _streamingText.isEmpty,
+                            stopped: _stopRequested,
+                            streaming: true,
+                            onLinkTap: _openLink,
+                            onCodeCopy: (code) =>
+                                _copyText(code, label: 'Code copié'),
+                          );
+                        },
+                      ),
+                    ),
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: _ScrollToBottomButton(
+                      visible:
+                          _showScrollButton &&
+                          (messages.isNotEmpty || _generating),
+                      onTap: () => _scrollToBottom(force: true),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_generationError != null)
+              _ErrorBanner(
+                message: _generationError!,
+                onClose: () => setState(() => _generationError = null),
+              ),
+            _Composer(
+              controller: _input,
+              generating: _generating,
+              stopRequested: _stopRequested,
+              onSend: _send,
+              onStop: _stop,
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  void _onMenu(_ChatMenuAction action) {
+    final conversation = _active;
+    if (conversation == null) return;
+
+    switch (action) {
+      case _ChatMenuAction.share:
+        unawaited(_shareConversation(conversation));
+      case _ChatMenuAction.rename:
+        unawaited(_renameConversation(conversation));
+      case _ChatMenuAction.newChat:
+        _newConversation();
+      case _ChatMenuAction.about:
+        _showAbout();
+    }
   }
 
   void _showAbout() {
@@ -309,64 +735,211 @@ class _ChatPageState extends State<ChatPage> {
 
 class _MessageBubble extends StatelessWidget {
   const _MessageBubble({
-    required this.message,
+    required this.fromUser,
+    required this.text,
+    this.createdAt,
+    this.elapsedMs,
     this.pending = false,
     this.stopped = false,
     this.streaming = false,
+    this.onCopy,
+    this.onShare,
+    this.onDelete,
+    this.onRegenerate,
+    this.onLinkTap,
+    this.onCodeCopy,
   });
 
-  final _ChatMessage message;
+  final bool fromUser;
+  final String text;
+  final DateTime? createdAt;
+  final int? elapsedMs;
   final bool pending;
   final bool stopped;
   final bool streaming;
+  final VoidCallback? onCopy;
+  final VoidCallback? onShare;
+  final VoidCallback? onDelete;
+  final VoidCallback? onRegenerate;
+  final void Function(String url, String title)? onLinkTap;
+  final void Function(String code)? onCodeCopy;
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final isUser = message.fromUser;
-    final text = message.text.isEmpty
-        ? (stopped ? 'Arrêté.' : 'Le modèle réfléchit…')
-        : message.text;
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final isUser = fromUser;
+
+    final Widget content;
+    if (pending) {
+      content = stopped ? const Text('Arrêté.') : const _TypingDots();
+    } else if (isUser) {
+      content = Text(text);
+    } else {
+      content = GptMarkdown(
+        text,
+        isStreaming: streaming,
+        onLinkTap: onLinkTap,
+        onCodeCopy: onCodeCopy,
+      );
+    }
 
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 560),
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: isUser ? colors.primaryContainer : colors.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(16),
+        constraints: const BoxConstraints(maxWidth: 640),
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        child: Column(
+          crossAxisAlignment: isUser
+              ? CrossAxisAlignment.end
+              : CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: isUser
+                    ? colors.primaryContainer
+                    : colors.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: content,
+            ),
+            if (!streaming) ...[
+              const SizedBox(height: 2),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Wrap(
+                  alignment: isUser ? WrapAlignment.end : WrapAlignment.start,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    if (createdAt != null)
+                      Text(
+                        _formatTime(createdAt!),
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                    if (elapsedMs != null)
+                      Text(
+                        ' · ${_formatElapsed(elapsedMs!)}',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                    if (onCopy != null)
+                      _iconAction(Icons.copy_rounded, 'Copier', onCopy!),
+                    if (onShare != null)
+                      _iconAction(
+                        Icons.ios_share_rounded,
+                        'Partager',
+                        onShare!,
+                      ),
+                    if (onRegenerate != null)
+                      _iconAction(Icons.refresh, 'Régénérer', onRegenerate!),
+                    if (onDelete != null)
+                      _iconAction(Icons.delete_outline, 'Supprimer', onDelete!),
+                  ],
+                ),
+              ),
+            ],
+          ],
         ),
-        child: pending
-            ? Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(width: 10),
-                  Text(text),
-                ],
-              )
-            : isUser
-            ? Text(text)
-            : GptMarkdown(text, isStreaming: streaming),
       ),
+    );
+  }
+
+  Widget _iconAction(IconData icon, String tooltip, VoidCallback onPressed) {
+    return IconButton(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 16),
+      tooltip: tooltip,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+      visualDensity: VisualDensity.compact,
+    );
+  }
+}
+
+class _TypingDots extends StatefulWidget {
+  const _TypingDots();
+
+  @override
+  State<_TypingDots> createState() => _TypingDotsState();
+}
+
+class _TypingDotsState extends State<_TypingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurfaceVariant;
+
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var i = 0; i < 3; i++) ...[
+              if (i > 0) const SizedBox(width: 4),
+              Opacity(
+                opacity:
+                    0.3 +
+                    0.7 *
+                        (0.5 +
+                            0.5 *
+                                math.sin(
+                                  _controller.value * 2 * math.pi - i * 0.6,
+                                )),
+                child: Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    color: color,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        );
+      },
     );
   }
 }
 
 class _EmptyChat extends StatelessWidget {
-  const _EmptyChat();
+  const _EmptyChat({required this.onSuggestion});
+
+  final ValueChanged<String> onSuggestion;
+
+  static const _suggestions = [
+    'Explique-moi la photosynthèse simplement.',
+    'Écris une fonction Dart qui inverse une chaîne.',
+    'Donne-moi trois idées de repas rapides.',
+  ];
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Center(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -388,6 +961,20 @@ class _EmptyChat extends StatelessWidget {
               'Vos échanges ne quittent pas l’appareil.',
               style: theme.textTheme.bodyMedium,
               textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final suggestion in _suggestions)
+                  ActionChip(
+                    avatar: const Icon(Icons.auto_awesome, size: 16),
+                    label: Text(suggestion),
+                    onPressed: () => onSuggestion(suggestion),
+                  ),
+              ],
             ),
           ],
         ),
@@ -446,6 +1033,29 @@ class _Composer extends StatelessWidget {
               tooltip: generating ? 'Arrêter' : 'Envoyer',
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ScrollToBottomButton extends StatelessWidget {
+  const _ScrollToBottomButton({required this.visible, required this.onTap});
+
+  final bool visible;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      ignoring: !visible,
+      child: AnimatedOpacity(
+        opacity: visible ? 1 : 0,
+        duration: const Duration(milliseconds: 150),
+        child: FloatingActionButton.small(
+          onPressed: onTap,
+          tooltip: 'Aller en bas',
+          child: const Icon(Icons.arrow_downward),
         ),
       ),
     );
@@ -537,4 +1147,14 @@ class _ErrorView extends StatelessWidget {
       ),
     );
   }
+}
+
+String _formatTime(DateTime dateTime) {
+  return '${dateTime.hour.toString().padLeft(2, '0')}:'
+      '${dateTime.minute.toString().padLeft(2, '0')}';
+}
+
+String _formatElapsed(int milliseconds) {
+  if (milliseconds < 1000) return '$milliseconds ms';
+  return '${(milliseconds / 1000).toStringAsFixed(1)} s';
 }

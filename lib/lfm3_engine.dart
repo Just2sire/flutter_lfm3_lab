@@ -45,27 +45,37 @@ class Lfm3Engine {
     );
 
     try {
-      final session = ChatSession(
-        engine,
-        maxContextTokens: contextSize,
-        systemPrompt: systemPrompt,
-      );
-
-      for (final turn in history) {
-        session.addMessage(
-          LlamaChatMessage.fromText(
-            role: turn.fromUser ? LlamaChatRole.user : LlamaChatRole.assistant,
-            text: turn.text,
-          ),
-        );
-      }
-
+      _session = _createSession(engine, history);
       _engine = engine;
-      _session = session;
     } catch (_) {
       await engine.dispose();
       rethrow;
     }
+  }
+
+  ChatSession _createSession(LlamaEngine engine, List<ChatTurn> history) {
+    final session = ChatSession(
+      engine,
+      maxContextTokens: contextSize,
+      systemPrompt: systemPrompt,
+    );
+
+    for (final turn in history) {
+      session.addMessage(
+        LlamaChatMessage.fromText(
+          role: turn.fromUser ? LlamaChatRole.user : LlamaChatRole.assistant,
+          text: turn.text,
+        ),
+      );
+    }
+
+    return session;
+  }
+
+  void setHistory(List<ChatTurn> history) {
+    final engine = _engine;
+    if (engine == null) return;
+    _session = _createSession(engine, history);
   }
 
   Stream<String> chat(
