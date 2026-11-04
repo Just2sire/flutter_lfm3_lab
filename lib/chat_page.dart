@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:gpt_markdown/gpt_markdown.dart';
 
 import 'lfm3_engine.dart';
 
@@ -231,7 +232,9 @@ class _ChatPageState extends State<ChatPage> {
                 : 'Réflexion désactivée',
           ),
           IconButton(
-            onPressed: _messages.isEmpty ? null : _newConversation,
+            onPressed: _messages.isEmpty || _generating
+                ? null
+                : _newConversation,
             icon: const Icon(Icons.delete_sweep_outlined),
             tooltip: 'Nouvelle conversation',
           ),
@@ -262,6 +265,7 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                         pending: _streamingText.isEmpty,
                         stopped: _stopRequested,
+                        streaming: true,
                       );
                     },
                   ),
@@ -308,11 +312,13 @@ class _MessageBubble extends StatelessWidget {
     required this.message,
     this.pending = false,
     this.stopped = false,
+    this.streaming = false,
   });
 
   final _ChatMessage message;
   final bool pending;
   final bool stopped;
+  final bool streaming;
 
   @override
   Widget build(BuildContext context) {
@@ -345,7 +351,9 @@ class _MessageBubble extends StatelessWidget {
                   Text(text),
                 ],
               )
-            : Text(text),
+            : isUser
+            ? Text(text)
+            : GptMarkdown(text, isStreaming: streaming),
       ),
     );
   }
@@ -377,7 +385,7 @@ class _EmptyChat extends StatelessWidget {
             const SizedBox(height: 8),
             Text(
               'Le modèle tourne entièrement sur cet appareil. '
-              'Vos échanges ne quittent pas le téléphone.',
+              'Vos échanges ne quittent pas l’appareil.',
               style: theme.textTheme.bodyMedium,
               textAlign: TextAlign.center,
             ),

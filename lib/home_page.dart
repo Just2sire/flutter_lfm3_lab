@@ -7,7 +7,9 @@ import 'model_downloader.dart';
 enum _ModelState { checking, missing, downloading, ready }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, this.modelReadyCheck});
+
+  final Future<bool> Function()? modelReadyCheck;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -35,7 +37,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _checkModel() async {
     try {
-      final ready = await Lfm3Model.isReady();
+      final ready = await (widget.modelReadyCheck ?? Lfm3Model.isReady)();
       if (!mounted) return;
       setState(() {
         _state = ready ? _ModelState.ready : _ModelState.missing;

@@ -44,23 +44,28 @@ class Lfm3Engine {
       ),
     );
 
-    final session = ChatSession(
-      engine,
-      maxContextTokens: contextSize,
-      systemPrompt: systemPrompt,
-    );
-
-    for (final turn in history) {
-      session.addMessage(
-        LlamaChatMessage.fromText(
-          role: turn.fromUser ? LlamaChatRole.user : LlamaChatRole.assistant,
-          text: turn.text,
-        ),
+    try {
+      final session = ChatSession(
+        engine,
+        maxContextTokens: contextSize,
+        systemPrompt: systemPrompt,
       );
-    }
 
-    _engine = engine;
-    _session = session;
+      for (final turn in history) {
+        session.addMessage(
+          LlamaChatMessage.fromText(
+            role: turn.fromUser ? LlamaChatRole.user : LlamaChatRole.assistant,
+            text: turn.text,
+          ),
+        );
+      }
+
+      _engine = engine;
+      _session = session;
+    } catch (_) {
+      await engine.dispose();
+      rethrow;
+    }
   }
 
   Stream<String> chat(
