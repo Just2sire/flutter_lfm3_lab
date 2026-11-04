@@ -1,0 +1,19 @@
+codecov:
+  branch: main
+
+coverage:
+  status:
+    project:
+      default:
+        target: 70%
+        threshold: 1%
+    patch:
+      default:
+        target: 70%
+        threshold: 1%
+
+ignore:
+  - "lib/src/backends/llama_cpp/bindings.dart"
+  - "lib/src/backends/llama_cpp/bindings_stub.dart"
+  - "example/**/*"
+  - "test/**/*"

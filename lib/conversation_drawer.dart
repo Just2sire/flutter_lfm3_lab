@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'conversation.dart';
+import 'lfm3_model.dart';
 
 enum ConversationAction { rename, delete }
 
@@ -9,20 +10,30 @@ class ConversationDrawer extends StatelessWidget {
     super.key,
     required this.conversations,
     required this.activeId,
+    required this.modelKind,
     required this.onNewChat,
     required this.onSelect,
     required this.onRename,
     required this.onDelete,
+    required this.onSelectModel,
     required this.onAbout,
   });
 
   final List<Conversation> conversations;
   final String? activeId;
+  final Lfm3ModelKind modelKind;
   final VoidCallback onNewChat;
   final ValueChanged<Conversation> onSelect;
   final ValueChanged<Conversation> onRename;
   final ValueChanged<Conversation> onDelete;
+  final ValueChanged<Lfm3ModelKind> onSelectModel;
   final VoidCallback onAbout;
+
+  void _selectModel(BuildContext context, Lfm3ModelKind kind) {
+    if (kind == modelKind) return;
+    Navigator.of(context).maybePop();
+    onSelectModel(kind);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -89,6 +100,28 @@ class ConversationDrawer extends StatelessWidget {
                 ),
               ),
             ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+              child: Text(
+                'Modèle',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+            ),
+            _ModelTile(
+              label: 'LFM3-1.7B · texte',
+              icon: Icons.chat_bubble_outline,
+              selected: modelKind == Lfm3ModelKind.text,
+              onTap: () => _selectModel(context, Lfm3ModelKind.text),
+            ),
+            _ModelTile(
+              label: 'LFM3-Audio-2B · voix',
+              icon: Icons.graphic_eq,
+              selected: modelKind == Lfm3ModelKind.audio,
+              onTap: () => _selectModel(context, Lfm3ModelKind.audio),
+            ),
+            const Divider(height: 16),
             Expanded(
               child: sorted.isEmpty
                   ? Center(
@@ -125,6 +158,39 @@ class ConversationDrawer extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _ModelTile extends StatelessWidget {
+  const _ModelTile({
+    required this.label,
+    required this.icon,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return ListTile(
+      dense: true,
+      selected: selected,
+      selectedTileColor: colors.primaryContainer.withValues(alpha: 0.35),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+      leading: Icon(icon, size: 20),
+      title: Text(label, style: const TextStyle(fontSize: 13)),
+      trailing: selected
+          ? Icon(Icons.check, size: 18, color: colors.primary)
+          : null,
+      onTap: onTap,
     );
   }
 }

@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -11,20 +14,35 @@ import 'conversation.dart';
 import 'conversation_drawer.dart';
 import 'conversation_store.dart';
 import 'lfm3_engine.dart';
+import 'lfm3_model.dart';
+import 'speech_player.dart';
 
 enum _ChatMenuAction { share, rename, newChat, about }
 
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, required this.onModelInvalid});
+  const ChatPage({
+    super.key,
+    required this.spec,
+    required this.onModelInvalid,
+    required this.onSwitchModel,
+    required this.autoSpeak,
+    required this.onAutoSpeakChanged,
+  });
 
+  final Lfm3ModelSpec spec;
   final Future<void> Function() onModelInvalid;
+  final ValueChanged<Lfm3ModelKind> onSwitchModel;
+  final bool autoSpeak;
+  final ValueChanged<bool> onAutoSpeakChanged;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
 }
 
 class _ChatPageState extends State<ChatPage> {
-  final _engine = Lfm3Engine();
+  late final Lfm3Engine _engine;
+  late final AudioRecorder _recorder;
+  final _player = SpeechPlayer();
   final _store = ConversationStore();
   final _input = TextEditingController();
   final _scroll = ScrollController();
@@ -39,15 +57,34 @@ class _ChatPageState extends State<ChatPage> {
   bool _stopRequested = false;
   bool _enableThinking = false;
   bool _showScrollButton = false;
+  bool _recording = false;
+  bool _transcribing = false;
+  bool _synthesizing = false;
+  int _speechToken = 0;
+  int _playingToken = 0;
+  late final StreamSubscription<void> _playbackComplete;
+  int _recordSeconds = 0;
   String? _loadError;
   String? _generationError;
+  String? _speakingMessageId;
   String _streamingText = '';
   DateTime? _streamStartedAt;
+  DateTime? _recordStartedAt;
+  Timer? _recordTimer;
 
   @override
   void initState() {
     super.initState();
+    _engine = Lfm3Engine(spec: widget.spec);
+    _recorder = AudioRecorder();
     _lifecycle = AppLifecycleListener(onStateChange: _onLifecycle);
+    _playbackComplete = _player.onComplete.listen((_) {
+      if (!mounted || _playingToken != _speechToken) return;
+      setState(() {
+        _synthesizing = false;
+        _speakingMessageId = null;
+      });
+    });
     _scroll.addListener(_onScroll);
     _bootstrap();
   }
@@ -55,9 +92,13 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void dispose() {
     _lifecycle.dispose();
+    _recordTimer?.cancel();
+    _playbackComplete.cancel();
     _scroll.removeListener(_onScroll);
     _engine.stop();
     unawaited(_engine.dispose());
+    unawaited(_recorder.dispose());
+    unawaited(_player.dispose());
     _input.dispose();
     _scroll.dispose();
     super.dispose();
@@ -202,6 +243,9 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _runGeneration(Conversation conversation, String prompt) async {
+    await _stopSpeaking();
+    if (!mounted) return;
+
     setState(() {
       _generating = true;
       _stopRequested = false;
@@ -228,11 +272,11 @@ class _ChatPageState extends State<ChatPage> {
           ? null
           : DateTime.now().difference(startedAt).inMilliseconds;
 
+      ChatMessage? assistantMessage;
       setState(() {
         if (reply.isNotEmpty) {
-          conversation.messages.add(
-            ChatMessage.assistant(reply, elapsedMs: elapsedMs),
-          );
+          assistantMessage = ChatMessage.assistant(reply, elapsedMs: elapsedMs);
+          conversation.messages.add(assistantMessage!);
           conversation.updatedAt = DateTime.now();
         }
         _generating = false;
@@ -242,6 +286,12 @@ class _ChatPageState extends State<ChatPage> {
       });
       unawaited(_persist());
       if (reply.isNotEmpty) _scrollToBottom();
+
+      if (assistantMessage != null && widget.autoSpeak && widget.spec.isAudio) {
+        unawaited(
+          _speak(assistantMessage!.text, messageId: assistantMessage!.id),
+        );
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -255,15 +305,183 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _stop() {
-    if (!_generating || _stopRequested) return;
-    setState(() => _stopRequested = true);
-    _engine.stop();
+    if (_generating && !_stopRequested) {
+      setState(() => _stopRequested = true);
+      _engine.stop();
+    }
+    if (_synthesizing || _speakingMessageId != null) {
+      unawaited(_stopSpeaking());
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    if (!widget.spec.isAudio || _transcribing || _generating) return;
+    if (_recording) {
+      await _finishRecording();
+      return;
+    }
+
+    try {
+      if (!await _recorder.hasPermission()) {
+        if (mounted) _showSnack('Accès au micro refusé');
+        return;
+      }
+
+      final directory = await getTemporaryDirectory();
+      final path =
+          '${directory.path}/lfm3_rec_'
+          '${DateTime.now().millisecondsSinceEpoch}.wav';
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+        path: path,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _recording = true;
+        _recordStartedAt = DateTime.now();
+        _recordSeconds = 0;
+      });
+
+      _recordTimer?.cancel();
+      _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        final startedAt = _recordStartedAt;
+        if (!mounted || startedAt == null) return;
+        setState(() {
+          _recordSeconds = DateTime.now().difference(startedAt).inSeconds;
+        });
+      });
+    } catch (error) {
+      if (mounted) _showSnack('Micro indisponible : $error');
+    }
+  }
+
+  Future<void> _finishRecording() async {
+    _recordTimer?.cancel();
+    _recordTimer = null;
+
+    String? path;
+    try {
+      path = await _recorder.stop();
+    } catch (_) {
+      path = null;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _recording = false;
+      _recordStartedAt = null;
+      _recordSeconds = 0;
+      _transcribing = path != null;
+    });
+
+    if (path == null) {
+      _showSnack('Aucun enregistrement');
+      return;
+    }
+
+    try {
+      final transcript = await _engine.transcribe(path, language: 'French');
+      if (!mounted) return;
+      if (transcript.isEmpty) {
+        _showSnack('Transcription vide');
+      } else {
+        setState(() {
+          _input.text = transcript;
+          _input.selection = TextSelection.collapsed(offset: transcript.length);
+        });
+      }
+    } catch (error) {
+      if (mounted) _showSnack(_friendlyError(error));
+    } finally {
+      if (mounted) setState(() => _transcribing = false);
+      try {
+        await File(path).delete();
+      } catch (_) {
+        // Ignore cleanup errors.
+      }
+    }
+  }
+
+  Future<void> _cancelRecording() async {
+    _recordTimer?.cancel();
+    _recordTimer = null;
+    try {
+      final path = await _recorder.stop();
+      if (path != null) await File(path).delete();
+    } catch (_) {
+      // Ignore cancellation errors.
+    }
+    if (!mounted) return;
+    setState(() {
+      _recording = false;
+      _recordStartedAt = null;
+      _recordSeconds = 0;
+    });
+  }
+
+  Future<void> _speak(String text, {String? messageId}) async {
+    if (!widget.spec.isAudio ||
+        text.trim().isEmpty ||
+        _generating ||
+        _transcribing ||
+        _recording) {
+      return;
+    }
+
+    await _stopSpeaking();
+    if (!mounted) return;
+
+    final token = ++_speechToken;
+    setState(() {
+      _synthesizing = true;
+      _speakingMessageId = messageId;
+    });
+
+    try {
+      final wav = await _engine.synthesize(text, language: 'fr');
+      if (!mounted || token != _speechToken) return;
+
+      _playingToken = token;
+      setState(() => _synthesizing = false);
+      await _player.play(wav);
+    } catch (error) {
+      if (mounted && token == _speechToken) {
+        _showSnack('Lecture vocale indisponible : $error');
+        setState(() {
+          _synthesizing = false;
+          _speakingMessageId = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _stopSpeaking() async {
+    _speechToken++;
+    _playingToken = 0;
+    _engine.stopSpeech();
+    try {
+      await _player.stop();
+    } catch (_) {
+      // The player may not be initialized yet.
+    }
+    if (mounted) {
+      setState(() {
+        _synthesizing = false;
+        _speakingMessageId = null;
+      });
+    }
   }
 
   void _newConversation() {
     final active = _active;
     if (active != null && active.messages.isEmpty) return;
 
+    unawaited(_stopSpeaking());
     _engine.stop();
     final conversation = Conversation.empty();
     setState(() {
@@ -285,6 +503,7 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
+    unawaited(_stopSpeaking());
     _engine.stop();
     setState(() {
       _active = conversation;
@@ -363,6 +582,7 @@ class _ChatPageState extends State<ChatPage> {
 
     if (confirmed != true || !mounted) return;
 
+    unawaited(_stopSpeaking());
     _engine.stop();
     setState(() {
       _conversations.removeWhere((item) => item.id == conversation.id);
@@ -386,6 +606,7 @@ class _ChatPageState extends State<ChatPage> {
     final conversation = _active;
     if (conversation == null || _generating) return;
 
+    if (_speakingMessageId == message.id) unawaited(_stopSpeaking());
     setState(() {
       conversation.messages.removeWhere((item) => item.id == message.id);
       conversation.updatedAt = DateTime.now();
@@ -493,6 +714,9 @@ class _ChatPageState extends State<ChatPage> {
     if (text.contains('Modèle introuvable')) {
       return 'Le fichier du modèle est absent. Retéléchargez-le.';
     }
+    if (text.contains('Projecteur audio introuvable')) {
+      return 'Le projecteur audio est absent. Retéléchargez le modèle voix.';
+    }
     return text;
   }
 
@@ -547,6 +771,16 @@ class _ChatPageState extends State<ChatPage> {
             overflow: TextOverflow.ellipsis,
           ),
           actions: [
+            if (widget.spec.isAudio)
+              IconButton(
+                onPressed: () => widget.onAutoSpeakChanged(!widget.autoSpeak),
+                icon: Icon(
+                  widget.autoSpeak ? Icons.volume_up : Icons.volume_off,
+                ),
+                tooltip: widget.autoSpeak
+                    ? 'Lecture auto activée'
+                    : 'Lecture auto désactivée',
+              ),
             IconButton(
               onPressed: () =>
                   setState(() => _enableThinking = !_enableThinking),
@@ -601,6 +835,7 @@ class _ChatPageState extends State<ChatPage> {
         drawer: ConversationDrawer(
           conversations: _conversations,
           activeId: conversation.id,
+          modelKind: widget.spec.kind,
           onNewChat: () {
             Navigator.of(context).maybePop();
             _newConversation();
@@ -608,6 +843,7 @@ class _ChatPageState extends State<ChatPage> {
           onSelect: _selectConversation,
           onRename: _renameConversation,
           onDelete: _deleteConversation,
+          onSelectModel: widget.onSwitchModel,
           onAbout: () {
             Navigator.of(context).maybePop();
             _showAbout();
@@ -647,6 +883,21 @@ class _ChatPageState extends State<ChatPage> {
                                   !_generating && !message.fromUser && isLast
                                   ? _regenerate
                                   : null,
+                              onSpeak: widget.spec.isAudio && !message.fromUser
+                                  ? () {
+                                      if (_speakingMessageId == message.id) {
+                                        unawaited(_stopSpeaking());
+                                      } else {
+                                        unawaited(
+                                          _speak(
+                                            message.text,
+                                            messageId: message.id,
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  : null,
+                              speaking: _speakingMessageId == message.id,
                               onLinkTap: _openLink,
                               onCodeCopy: (code) =>
                                   _copyText(code, label: 'Code copié'),
@@ -684,10 +935,24 @@ class _ChatPageState extends State<ChatPage> {
                 message: _generationError!,
                 onClose: () => setState(() => _generationError = null),
               ),
+            if (_recording || _transcribing || _synthesizing)
+              _VoiceBanner(
+                recording: _recording,
+                transcribing: _transcribing,
+                synthesizing: _synthesizing,
+                seconds: _recordSeconds,
+                onCancel: _recording
+                    ? _cancelRecording
+                    : (_synthesizing ? () => unawaited(_stopSpeaking()) : null),
+              ),
             _Composer(
               controller: _input,
               generating: _generating,
               stopRequested: _stopRequested,
+              showMic: widget.spec.isAudio,
+              recording: _recording,
+              transcribing: _transcribing,
+              onMic: _toggleRecording,
               onSend: _send,
               onStop: _stop,
             ),
@@ -746,6 +1011,8 @@ class _MessageBubble extends StatelessWidget {
     this.onShare,
     this.onDelete,
     this.onRegenerate,
+    this.onSpeak,
+    this.speaking = false,
     this.onLinkTap,
     this.onCodeCopy,
   });
@@ -761,6 +1028,8 @@ class _MessageBubble extends StatelessWidget {
   final VoidCallback? onShare;
   final VoidCallback? onDelete;
   final VoidCallback? onRegenerate;
+  final VoidCallback? onSpeak;
+  final bool speaking;
   final void Function(String url, String title)? onLinkTap;
   final void Function(String code)? onCodeCopy;
 
@@ -833,6 +1102,12 @@ class _MessageBubble extends StatelessWidget {
                         Icons.ios_share_rounded,
                         'Partager',
                         onShare!,
+                      ),
+                    if (onSpeak != null)
+                      _iconAction(
+                        speaking ? Icons.stop_rounded : Icons.volume_up,
+                        speaking ? 'Arrêter la lecture' : 'Lire à voix haute',
+                        onSpeak!,
                       ),
                     if (onRegenerate != null)
                       _iconAction(Icons.refresh, 'Régénérer', onRegenerate!),
@@ -988,6 +1263,10 @@ class _Composer extends StatelessWidget {
     required this.controller,
     required this.generating,
     required this.stopRequested,
+    required this.showMic,
+    required this.recording,
+    required this.transcribing,
+    required this.onMic,
     required this.onSend,
     required this.onStop,
   });
@@ -995,11 +1274,16 @@ class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final bool generating;
   final bool stopRequested;
+  final bool showMic;
+  final bool recording;
+  final bool transcribing;
+  final VoidCallback onMic;
   final VoidCallback onSend;
   final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
     return SafeArea(
       top: false,
       child: Padding(
@@ -1007,6 +1291,15 @@ class _Composer extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
+            if (showMic) ...[
+              IconButton.filledTonal(
+                onPressed: generating || transcribing ? null : onMic,
+                icon: Icon(recording ? Icons.stop : Icons.mic),
+                color: recording ? colors.error : null,
+                tooltip: recording ? 'Arrêter la dictée' : 'Dicter un message',
+              ),
+              const SizedBox(width: 8),
+            ],
             Expanded(
               child: TextField(
                 controller: controller,
@@ -1057,6 +1350,68 @@ class _ScrollToBottomButton extends StatelessWidget {
           tooltip: 'Aller en bas',
           child: const Icon(Icons.arrow_downward),
         ),
+      ),
+    );
+  }
+}
+
+class _VoiceBanner extends StatelessWidget {
+  const _VoiceBanner({
+    required this.recording,
+    required this.transcribing,
+    required this.synthesizing,
+    required this.seconds,
+    this.onCancel,
+  });
+
+  final bool recording;
+  final bool transcribing;
+  final bool synthesizing;
+  final int seconds;
+  final VoidCallback? onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    final String label;
+    final Widget leading;
+    if (recording) {
+      final minutes = (seconds ~/ 60).toString().padLeft(2, '0');
+      final secs = (seconds % 60).toString().padLeft(2, '0');
+      label = 'Enregistrement… $minutes:$secs';
+      leading = Icon(Icons.fiber_manual_record, color: colors.error, size: 18);
+    } else if (transcribing) {
+      label = 'Transcription en cours…';
+      leading = const SizedBox(
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    } else {
+      label = 'Synthèse vocale…';
+      leading = const SizedBox(
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      color: colors.surfaceContainerHigh,
+      padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+      child: Row(
+        children: [
+          leading,
+          const SizedBox(width: 10),
+          Expanded(child: Text(label)),
+          if (onCancel != null)
+            TextButton(
+              onPressed: onCancel,
+              child: Text(recording ? 'Annuler' : 'Arrêter'),
+            ),
+        ],
       ),
     );
   }

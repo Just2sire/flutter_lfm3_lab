@@ -1,0 +1,152 @@
+import 'package:dinja/dinja.dart';
+
+import '../../models/chat/chat_message.dart';
+import '../../models/chat/chat_template_result.dart';
+import '../../models/tools/tool_definition.dart';
+import '../chat_format.dart';
+import '../chat_parse_result.dart';
+import '../chat_template_handler.dart';
+import '../template_internal_metadata.dart';
+import '../thinking_utils.dart';
+import '../xml_tool_call_format.dart';
+
+/// Handler for Seed-OSS format.
+///
+/// Uses `<seed:think>`/`</seed:think>` for reasoning and
+/// `<seed:tool_call><function=...>...</function></seed:tool_call>` for tools.
+class SeedOssHandler extends ChatTemplateHandler {
+  @override
+  ChatFormat get format => ChatFormat.seedOss;
+
+  @override
+  TemplateToolCallSerialization get toolCallSerialization =>
+      TemplateToolCallSerialization.normalizeOnly;
+
+  @override
+  String get thinkingStartTag => '<seed:think>';
+
+  @override
+  String get thinkingEndTag => '</seed:think>';
+
+  @override
+  List<String> get additionalStops => [];
+
+  @override
+  List<String> get preservedTokens => const [
+    '<seed:think>',
+    '</seed:think>',
+    '<seed:tool_call>',
+    '</seed:tool_call>',
+    '<function=',
+    '</function>',
+    '<parameter=',
+    '</parameter>',
+  ];
+
+  @override
+  LlamaChatTemplateResult render({
+    required String templateSource,
+    required List<LlamaChatMessage> messages,
+    required Map<String, String> metadata,
+    bool addAssistant = true,
+    List<ToolDefinition>? tools,
+    bool enableThinking = true,
+  }) {
+    final template = Template(templateSource);
+    var prompt = renderTemplate(
+      template,
+      metadata: metadata,
+      context: {
+        'messages': templateMessages(messages, templateSource: templateSource),
+        'add_generation_prompt': addAssistant,
+        'tools': tools?.map((t) => t.toJson()).toList(),
+        'bos_token': metadata['tokenizer.ggml.bos_token'] ?? '<s>',
+        'eos_token': metadata['tokenizer.ggml.eos_token'] ?? '</s>',
+      },
+    );
+
+    var thinkingForcedOpen = false;
+    var thoughtClosed = false;
+    if (isThinkingForcedOpen(prompt, startTag: thinkingStartTag)) {
+      if (!enableThinking) {
+        prompt = '${prompt.trimRight()}$thinkingEndTag';
+        thoughtClosed = true;
+      } else {
+        thinkingForcedOpen = true;
+      }
+    }
+
+    final hasTools = tools != null && tools.isNotEmpty;
+    final rendered = LlamaChatTemplateResult(
+      prompt: prompt,
+      format: format.index,
+      grammar: requiredGrammarAfterThought(
+        buildXmlToolCallGrammar(
+          tools,
+          XmlToolCallFormat.seedOss,
+          parallelToolCalls:
+              metadata[internalParallelToolCallsMetadataKey] == 'true',
+        ),
+        metadata: metadata,
+        thinkingForcedOpen: thinkingForcedOpen,
+      ),
+      grammarLazy: hasTools,
+      thinkingForcedOpen: thinkingForcedOpen,
+      additionalStops: getStops(
+        hasTools: hasTools,
+        enableThinking: enableThinking,
+      ),
+      preservedTokens: hasTools ? preservedTokens : const [],
+      // llama.cpp starts only on the line-broken scope; the grammar and the
+      // parse also take one without the line break.
+      grammarTriggers: hasTools
+          ? const [
+              GrammarTrigger(type: 0, value: '<seed:tool_call>\n'),
+              GrammarTrigger(type: 0, value: '<seed:tool_call><function='),
+            ]
+          : const [],
+    );
+    return withThoughtClosedForThinkingOff(rendered, closed: thoughtClosed);
+  }
+
+  @override
+  ChatParseResult parse(
+    String output, {
+    bool isPartial = false,
+    bool parseToolCalls = true,
+    bool thinkingForcedOpen = false,
+  }) {
+    // As in llama.cpp, a thought the prompt opened is the reply up to the
+    // first end tag, verbatim, and one it did not open exists only when the
+    // reply starts with the start tag. Later thinking tags are content.
+    final reply = trimLeftAsciiSpace(output);
+    final thought = thinkingForcedOpen
+        ? extractForcedOpenThoughtVerbatim(output, endTag: thinkingEndTag)
+        : reply.startsWith(thinkingStartTag)
+        ? extractForcedOpenThoughtVerbatim(
+            reply.substring(thinkingStartTag.length),
+            endTag: thinkingEndTag,
+          )
+        : null;
+    final parsed = parseXmlToolCalls(
+      thought?.content ?? output,
+      XmlToolCallFormat.seedOss,
+      parseToolCalls: parseToolCalls,
+      extractsThought: false,
+    );
+    return ChatParseResult(
+      content: parsed.content.trim(),
+      reasoningContent: thought?.reasoning,
+      toolCalls: parsed.toolCalls,
+    );
+  }
+
+  @override
+  String? buildGrammar(List<ToolDefinition>? tools) {
+    return buildXmlToolCallGrammar(
+      tools,
+      XmlToolCallFormat.seedOss,
+      parallelToolCalls: false,
+    );
+  }
+}
