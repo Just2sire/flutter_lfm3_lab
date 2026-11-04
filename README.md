@@ -17,7 +17,9 @@ Application Flutter de démonstration pour exécuter **LFM3-1.7B** (texte) et **
 
 ```bash
 flutter pub get
-flutter run -d linux   # ou -d <appareil Android>
+flutter run -d linux     # Linux
+flutter run -d windows   # Windows
+flutter run -d <appareil> # Android
 ```
 
 Le modèle est téléchargé au premier lancement. Pour utiliser des fichiers locaux :
@@ -42,6 +44,13 @@ flutter analyze
 flutter test
 flutter build apk --debug
 flutter build linux --debug
+flutter build windows --debug
+```
+
+L'application Windows compilée se lance avec :
+
+```powershell
+.\build\windows\x64\runner\Debug\flutter_lfm3_lab.exe
 ```
 
 ## Note desktop (CPU ancien)

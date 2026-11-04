@@ -510,11 +510,21 @@ flutter pub get
 Puis :
 
 ```bash
-# Application desktop
+# Linux
 flutter run -d linux
 
-# ou Android
+# Windows
+flutter run -d windows
+
+# Android
 flutter run -d <appareil>
+```
+
+Build Windows puis lancement :
+
+```powershell
+flutter build windows --debug
+.\build\windows\x64\runner\Debug\flutter_lfm3_lab.exe
 ```
 
 Au premier lancement, l'écran d'accueil propose les deux modèles. Choisir
@@ -545,7 +555,14 @@ Prérequis Linux :
 - `paplay` (PulseAudio) ou `aplay` (ALSA) pour la lecture TTS ;
 - `record` gère le micro via les backends système disponibles.
 
-Sur un CPU sans AVX2/FMA/BMI2, appliquer le hack décrit au §7 avant de lancer.
+Prérequis Windows :
+
+- Windows 10/11 avec le SDK Flutter Windows activé ;
+- PowerShell pour la lecture TTS (`Media.SoundPlayer`) ;
+- micro accessible par le système pour l'ASR.
+
+Sur un CPU sans AVX2/FMA/BMI2, appliquer le hack décrit au §7 avant de lancer
+(variante `windows-x64` du bundle natif).
 
 ---
 
