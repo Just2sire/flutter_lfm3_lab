@@ -1,16 +1,21 @@
 import 'package:flutter/material.dart';
 
+import 'home_page.dart';
+
 void main() {
-  runApp(const MainApp());
+  runApp(const Lfm3App());
 }
 
-class MainApp extends StatelessWidget {
-  const MainApp({super.key});
+class Lfm3App extends StatelessWidget {
+  const Lfm3App({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
-      home: Scaffold(body: Center(child: Text('Hello World!'))),
+    return MaterialApp(
+      title: 'LFM3 Lab',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(colorSchemeSeed: Colors.brown, useMaterial3: true),
+      home: const HomePage(),
     );
   }
 }
