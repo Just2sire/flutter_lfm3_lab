@@ -71,13 +71,6 @@ Windows et son CMake pouvait échouer selon la présence d'un JDK.
 
 Le binaire `libggml-cpu.so` fourni par `llamadart` exige AVX2/FMA/BMI2. Sur un CPU qui ne les a pas (ex. i5-3210M), le chargement échoue avec « not supported on this system ». Pour le test desktop, un module baseline a été compilé depuis llama.cpp v0.8.0 (commit `8642541b255bfb5dc39cd351a178be09013a55d6`) avec `GGML_AVX2=OFF`, `GGML_FMA=OFF` et `GGML_BMI2=OFF`, puis injecté dans le cache natif `linux-x64`. Le SHA de `native_release_pins.dart` a été remis à sa valeur officielle dans le dépôt ; sur un CPU ancien, il faut réappliquer ce hack localement. Cette modification ne concerne pas Android (runtime arm64) et n'est pas nécessaire sur un CPU récent.
 
-## Documentation
-
-- [`docs/lfm3-flutter-on-device-plan.md`](docs/lfm3-flutter-on-device-plan.md) : conception initiale.
-- [`docs/lfm3-implementation.md`](docs/lfm3-implementation.md) : chat texte as-built.
-- [`docs/lfm3-audio-implementation.md`](docs/lfm3-audio-implementation.md) : plan et implémentation audio (ASR, TTS, fork `llamadart`).
-- [`docs/lfm3-omni-implementation-plan.md`](docs/lfm3-omni-implementation-plan.md) : plan d'implémentation de LFM3-Omni-2B (vision, audio, voix).
-
 ## Vie privée
 
 Le modèle et les conversations restent sur l'appareil. Aucune requête n'est envoyée pendant le chat.
