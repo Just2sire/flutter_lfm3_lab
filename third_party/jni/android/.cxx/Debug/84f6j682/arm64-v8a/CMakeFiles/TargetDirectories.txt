@@ -1,3 +1,0 @@
-/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/android/.cxx/Debug/84f6j682/arm64-v8a/CMakeFiles/jni.dir
-/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/android/.cxx/Debug/84f6j682/arm64-v8a/CMakeFiles/edit_cache.dir
-/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/android/.cxx/Debug/84f6j682/arm64-v8a/CMakeFiles/rebuild_cache.dir
