@@ -14,7 +14,7 @@ class Lfm3App extends StatelessWidget {
     return MaterialApp(
       title: 'LFM3 Lab',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: Colors.blueGrey, useMaterial3: true),
+      theme: ThemeData(colorSchemeSeed: Colors.brown, useMaterial3: true),
       home: const HomePage(),
     );
   }
