@@ -53,6 +53,20 @@ L'application Windows compilée se lance avec :
 .\build\windows\x64\runner\Debug\flutter_lfm3_lab.exe
 ```
 
+## Note Windows
+
+Le runner Windows est généré dans `windows/`. Sur la machine Windows :
+
+```powershell
+flutter config --enable-windows-desktop
+flutter run -d windows
+```
+
+La lecture TTS utilise PowerShell (`Media.SoundPlayer`) et l'ASR `record_windows`.
+Le paquet transitif `jni` (via `path_provider_android`) est vendorisé dans
+`third_party/jni` avec son plugin Windows désactivé : il n'est pas utile sur
+Windows et son CMake pouvait échouer selon la présence d'un JDK.
+
 ## Note desktop (CPU ancien)
 
 Le binaire `libggml-cpu.so` fourni par `llamadart` exige AVX2/FMA/BMI2. Sur un CPU qui ne les a pas (ex. i5-3210M), le chargement échoue avec « not supported on this system ». Pour le test desktop, un module baseline a été compilé depuis llama.cpp v0.8.0 (commit `8642541b255bfb5dc39cd351a178be09013a55d6`) avec `GGML_AVX2=OFF`, `GGML_FMA=OFF` et `GGML_BMI2=OFF`, puis injecté dans le cache natif `linux-x64`. Le SHA de `native_release_pins.dart` a été remis à sa valeur officielle dans le dépôt ; sur un CPU ancien, il faut réappliquer ce hack localement. Cette modification ne concerne pas Android (runtime arm64) et n'est pas nécessaire sur un CPU récent.

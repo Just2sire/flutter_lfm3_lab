@@ -1,0 +1,38 @@
+{
+  "buildFiles": [
+    "/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/src/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/home/desire/Android/Sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/android/.cxx/Debug/84f6j682/x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/home/desire/Android/Sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/home/desire/.pub-cache/hosted/pub.dev/jni-1.1.2/android/.cxx/Debug/84f6j682/x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "jni::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "x86",
+      "artifactName": "jni",
+      "output": "/home/desire/Documents/flutter_lfm3_lab/build/jni/intermediates/cxx/Debug/84f6j682/obj/x86/libdartjni.so",
+      "runtimeFiles": []
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "/home/desire/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang.lld",
+      "cppCompilerExecutable": "/home/desire/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++.lld"
+    }
+  },
+  "cFileExtensions": [
+    "c"
+  ],
+  "cppFileExtensions": []
+}
