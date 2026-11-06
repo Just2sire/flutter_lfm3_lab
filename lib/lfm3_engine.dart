@@ -98,14 +98,23 @@ class Lfm3Engine {
   Stream<String> chat(
     String userMessage, {
     bool enableThinking = false,
+    String? context,
+    List<LlamaContentPart> media = const [],
   }) async* {
     final session = _session;
     if (session == null) {
       throw StateError('Le modèle n’est pas chargé.');
     }
 
+    final trimmedContext = context?.trim();
+    final prompt = trimmedContext == null || trimmedContext.isEmpty
+        ? userMessage
+        : 'Contexte extrait des pièces jointes :\n'
+              '$trimmedContext\n\n'
+              'Question : $userMessage';
+
     await for (final chunk in session.create(
-      [LlamaTextContent(userMessage)],
+      [LlamaTextContent(prompt), ...media],
       enableThinking: enableThinking,
       params: generationParams,
     )) {

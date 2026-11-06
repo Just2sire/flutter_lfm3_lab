@@ -12,15 +12,28 @@ class ModelDownloader {
   Future<void> download(
     Lfm3ModelSpec spec, {
     required void Function(int received, int? total) onProgress,
+  }) {
+    return downloadFiles(
+      spec.files,
+      totalSizeBytes: spec.totalSizeBytes,
+      resolve: Lfm3Model.fileOf,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<void> downloadFiles(
+    List<Lfm3ModelFile> files, {
+    required int totalSizeBytes,
+    required Future<File> Function(Lfm3ModelFile file) resolve,
+    required void Function(int received, int? total) onProgress,
   }) async {
-    final total = spec.totalSizeBytes;
     var offset = 0;
 
-    for (final file in spec.files) {
-      final destination = await Lfm3Model.fileOf(file);
+    for (final file in files) {
+      final destination = await resolve(file);
       if (await _isComplete(destination, file.sizeBytes)) {
         offset += file.sizeBytes;
-        onProgress(offset, total);
+        onProgress(offset, totalSizeBytes);
         continue;
       }
 
@@ -28,13 +41,13 @@ class ModelDownloader {
         file,
         destination,
         offset: offset,
-        total: total,
+        total: totalSizeBytes,
         onProgress: onProgress,
       );
       offset += file.sizeBytes;
     }
 
-    onProgress(total, total);
+    onProgress(totalSizeBytes, totalSizeBytes);
   }
 
   Future<bool> _isComplete(File file, int expectedSize) async {

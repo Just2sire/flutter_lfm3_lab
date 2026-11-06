@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
@@ -13,11 +15,47 @@ import 'package:url_launcher/url_launcher.dart';
 import 'conversation.dart';
 import 'conversation_drawer.dart';
 import 'conversation_store.dart';
+import 'embedding_engine.dart';
+import 'embedding_model.dart';
 import 'lfm3_engine.dart';
 import 'lfm3_model.dart';
+import 'model_downloader.dart';
+import 'rag.dart';
+import 'rag_service.dart';
 import 'speech_player.dart';
 
 enum _ChatMenuAction { share, rename, newChat, about }
+
+enum _AttachmentStatus { indexing, ready, error }
+
+class _AttachmentEntry {
+  _AttachmentEntry({
+    required this.id,
+    required this.name,
+    required this.kind,
+    this.status = _AttachmentStatus.indexing,
+    this.attachment,
+    this.statusText,
+  });
+
+  factory _AttachmentEntry.fromAttachment(RagAttachment attachment) {
+    return _AttachmentEntry(
+      id: attachment.id,
+      name: attachment.name,
+      kind: attachment.kind,
+      status: _AttachmentStatus.ready,
+      attachment: attachment,
+    );
+  }
+
+  final String id;
+  final String name;
+  final RagAttachmentKind kind;
+  _AttachmentStatus status;
+  RagAttachment? attachment;
+  String? error;
+  String? statusText;
+}
 
 class ChatPage extends StatefulWidget {
   const ChatPage({
@@ -42,11 +80,14 @@ class ChatPage extends StatefulWidget {
 class _ChatPageState extends State<ChatPage> {
   late final Lfm3Engine _engine;
   late final AudioRecorder _recorder;
+  late final RagService _rag;
+  final _embedding = EmbeddingEngine();
   final _player = SpeechPlayer();
   final _store = ConversationStore();
   final _input = TextEditingController();
   final _scroll = ScrollController();
   final _conversations = <Conversation>[];
+  final _attachmentEntries = <_AttachmentEntry>[];
 
   Conversation? _active;
   late final AppLifecycleListener _lifecycle;
@@ -60,6 +101,10 @@ class _ChatPageState extends State<ChatPage> {
   bool _recording = false;
   bool _transcribing = false;
   bool _synthesizing = false;
+  bool _ragLoading = false;
+  bool _downloadingEmbedding = false;
+  int _embeddingReceived = 0;
+  int _embeddingTotal = EmbeddingModel.spec.totalSizeBytes;
   int _speechToken = 0;
   int _playingToken = 0;
   late final StreamSubscription<void> _playbackComplete;
@@ -77,6 +122,7 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     _engine = Lfm3Engine(spec: widget.spec);
     _recorder = AudioRecorder();
+    _rag = RagService(embedding: _embedding);
     _lifecycle = AppLifecycleListener(onStateChange: _onLifecycle);
     _playbackComplete = _player.onComplete.listen((_) {
       if (!mounted || _playingToken != _speechToken) return;
@@ -97,6 +143,7 @@ class _ChatPageState extends State<ChatPage> {
     _scroll.removeListener(_onScroll);
     _engine.stop();
     unawaited(_engine.dispose());
+    unawaited(_embedding.dispose());
     unawaited(_recorder.dispose());
     unawaited(_player.dispose());
     _input.dispose();
@@ -123,7 +170,289 @@ class _ChatPageState extends State<ChatPage> {
     });
 
     unawaited(_persist());
+    await _loadAttachments();
     await _loadModel(withHistory: _historyOf(_active).isNotEmpty);
+  }
+
+  Future<void> _loadAttachments() async {
+    final conversation = _active;
+    if (conversation == null) return;
+    final index = await _rag.indexFor(conversation.id);
+    if (!mounted) return;
+    setState(() {
+      _attachmentEntries
+        ..clear()
+        ..addAll(index.attachments.map(_AttachmentEntry.fromAttachment));
+    });
+  }
+
+  bool get _indexingAttachment => _attachmentEntries.any(
+    (entry) => entry.status == _AttachmentStatus.indexing,
+  );
+
+  Future<bool> _ensureEmbeddingModel({bool interactive = true}) async {
+    if (_embedding.isLoaded) return true;
+    if (_ragLoading) return false;
+
+    if (!await EmbeddingModel.isReady()) {
+      if (!interactive || !mounted) return false;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Modèle de recherche requis'),
+          content: Text(
+            'EmbeddingGemma-2 (${_formatBytes(EmbeddingModel.spec.totalSizeBytes)}) '
+            'doit être téléchargé pour indexer et rechercher dans les '
+            'pièces jointes. Il reste sur cet appareil.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Annuler'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Télécharger'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return false;
+      await _downloadEmbeddingModel();
+      if (!await EmbeddingModel.isReady()) return false;
+    }
+
+    if (!mounted) return false;
+    setState(() => _ragLoading = true);
+    try {
+      await _embedding.load();
+      if (!mounted) return false;
+      setState(() => _ragLoading = false);
+      return true;
+    } catch (error) {
+      if (!mounted) return false;
+      setState(() => _ragLoading = false);
+      _showSnack('Modèle de recherche indisponible : ${_friendlyError(error)}');
+      return false;
+    }
+  }
+
+  Future<void> _downloadEmbeddingModel() async {
+    if (_downloadingEmbedding) return;
+    final downloader = ModelDownloader();
+    setState(() {
+      _downloadingEmbedding = true;
+      _embeddingReceived = 0;
+      _embeddingTotal = EmbeddingModel.spec.totalSizeBytes;
+    });
+
+    try {
+      await downloader.downloadFiles(
+        EmbeddingModel.spec.files,
+        totalSizeBytes: EmbeddingModel.spec.totalSizeBytes,
+        resolve: EmbeddingModel.fileOf,
+        onProgress: (received, total) {
+          if (!mounted) return;
+          setState(() {
+            _embeddingReceived = received;
+            _embeddingTotal = total ?? EmbeddingModel.spec.totalSizeBytes;
+          });
+        },
+      );
+    } catch (error) {
+      if (mounted) {
+        _showSnack('Téléchargement échoué : ${_friendlyError(error)}');
+      }
+    } finally {
+      downloader.close();
+      if (mounted) setState(() => _downloadingEmbedding = false);
+    }
+  }
+
+  Future<void> _pickAttachments() async {
+    if (_downloadingEmbedding || _indexingAttachment || _generating) return;
+
+    const group = XTypeGroup(
+      label: 'Documents, images et audio',
+      extensions: [
+        'txt',
+        'md',
+        'markdown',
+        'csv',
+        'json',
+        'log',
+        'yaml',
+        'yml',
+        'xml',
+        'html',
+        'htm',
+        'dart',
+        'py',
+        'js',
+        'ts',
+        'java',
+        'kt',
+        'c',
+        'cpp',
+        'h',
+        'hpp',
+        'rs',
+        'go',
+        'rb',
+        'php',
+        'sh',
+        'sql',
+        'ini',
+        'toml',
+        'png',
+        'jpg',
+        'jpeg',
+        'webp',
+        'bmp',
+        'wav',
+      ],
+    );
+
+    List<XFile> files;
+    try {
+      files = await openFiles(acceptedTypeGroups: const [group]);
+    } catch (error) {
+      if (mounted) _showSnack('Sélection de fichiers indisponible : $error');
+      return;
+    }
+    if (files.isEmpty) return;
+
+    final ready = await _ensureEmbeddingModel(interactive: true);
+    if (!ready) return;
+
+    for (final file in files) {
+      if (!mounted) return;
+      await _addAttachment(file);
+    }
+  }
+
+  Future<void> _addAttachment(XFile file) async {
+    final conversation = _active;
+    if (conversation == null) return;
+
+    final name = file.name.isEmpty ? p.basename(file.path) : file.name;
+    final kind = ragKindForFileName(name);
+    if (kind == null) {
+      _showSnack('Format non pris en charge : $name');
+      return;
+    }
+
+    final conversationId = conversation.id;
+    final entry = _AttachmentEntry(
+      id: 'pending-${DateTime.now().microsecondsSinceEpoch}',
+      name: name,
+      kind: kind,
+      statusText: 'Indexation…',
+    );
+    setState(() => _attachmentEntries.add(entry));
+
+    try {
+      final attachment = await _rag.addFile(
+        conversationId: conversationId,
+        sourcePath: file.path,
+        name: name,
+        onStatus: (status) {
+          if (!mounted) return;
+          setState(() => entry.statusText = status);
+        },
+      );
+      if (!mounted || _active?.id != conversationId) return;
+      setState(() {
+        entry.attachment = attachment;
+        entry.status = _AttachmentStatus.ready;
+        entry.statusText = null;
+      });
+      _showSnack('« $name » indexé (${attachment.chunkCount} extraits)');
+    } catch (error) {
+      if (!mounted || _active?.id != conversationId) return;
+      setState(() {
+        entry.status = _AttachmentStatus.error;
+        entry.error = _friendlyError(error);
+        entry.statusText = null;
+      });
+      _showSnack('Indexation impossible : ${_friendlyError(error)}');
+    }
+  }
+
+  Future<void> _removeAttachment(_AttachmentEntry entry) async {
+    final attachment = entry.attachment;
+    final conversation = _active;
+    if (attachment == null || conversation == null) return;
+    try {
+      await _rag.removeAttachment(conversation.id, attachment);
+      if (!mounted) return;
+      setState(() => _attachmentEntries.remove(entry));
+    } catch (error) {
+      if (mounted) {
+        _showSnack('Suppression impossible : ${_friendlyError(error)}');
+      }
+    }
+  }
+
+  Future<String?> _searchContext(
+    Conversation conversation,
+    String prompt,
+  ) async {
+    if (!_attachmentEntries.any(
+      (entry) => entry.status == _AttachmentStatus.ready,
+    )) {
+      return null;
+    }
+
+    if (!_embedding.isLoaded) {
+      final ready = await _ensureEmbeddingModel(interactive: false);
+      if (!ready) {
+        if (mounted) {
+          _showSnack(
+            'Le modèle de recherche n’est pas chargé. '
+            'Ajoutez une pièce jointe pour le télécharger.',
+          );
+        }
+        return null;
+      }
+    }
+
+    try {
+      final results = await _rag.search(conversation.id, prompt);
+      if (results.isEmpty) return null;
+
+      final buffer = StringBuffer()
+        ..writeln(
+          'Contexte extrait des pièces jointes. Utilise-le pour répondre.',
+        )
+        ..writeln();
+      for (final result in results) {
+        final chunk = result.chunk;
+        final text = chunk.text?.trim();
+        if (text != null && text.isNotEmpty) {
+          buffer.writeln('[${chunk.sourceName}]');
+          buffer.writeln(text);
+          buffer.writeln();
+        } else {
+          buffer.writeln('[${chunk.sourceName} — ${chunk.kind.name}]');
+          buffer.writeln(
+            'Pièce jointe non textuelle : le modèle texte ne peut pas '
+            'lire son contenu directement.',
+          );
+          buffer.writeln();
+        }
+        if (buffer.length > 2800) break;
+      }
+      return buffer.toString().trim();
+    } catch (error) {
+      if (mounted) {
+        _showSnack(
+          'Recherche dans les pièces jointes indisponible : '
+          '${_friendlyError(error)}',
+        );
+      }
+      return null;
+    }
   }
 
   List<ChatTurn> _historyOf(Conversation? conversation) => [
@@ -166,9 +495,9 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _unloadModel() async {
-    if (!_engine.isLoaded) return;
     _engine.stop();
-    await _engine.dispose();
+    if (_engine.isLoaded) await _engine.dispose();
+    await _embedding.dispose();
   }
 
   Future<void> _persist() {
@@ -256,9 +585,12 @@ class _ChatPageState extends State<ChatPage> {
     _scrollToBottom(force: true);
 
     try {
+      final context = await _searchContext(conversation, prompt);
+      if (!mounted) return;
       await for (final chunk in _engine.chat(
         prompt,
         enableThinking: _enableThinking,
+        context: context,
       )) {
         if (!mounted) return;
         setState(() => _streamingText += chunk);
@@ -492,6 +824,7 @@ class _ChatPageState extends State<ChatPage> {
       _stopRequested = false;
       _generating = false;
       _streamStartedAt = null;
+      _attachmentEntries.clear();
     });
     if (_engine.isLoaded) _engine.setHistory(const <ChatTurn>[]);
     unawaited(_persist());
@@ -514,6 +847,7 @@ class _ChatPageState extends State<ChatPage> {
       _streamStartedAt = null;
     });
     if (_engine.isLoaded) _engine.setHistory(_historyOf(conversation));
+    unawaited(_loadAttachments());
     unawaited(_persist());
     _scrollToBottom(force: true);
     Navigator.of(context).maybePop();
@@ -599,6 +933,8 @@ class _ChatPageState extends State<ChatPage> {
       }
     });
     if (_engine.isLoaded) _engine.setHistory(_historyOf(_active));
+    unawaited(_rag.deleteConversation(conversation.id));
+    unawaited(_loadAttachments());
     unawaited(_persist());
   }
 
@@ -716,6 +1052,13 @@ class _ChatPageState extends State<ChatPage> {
     }
     if (text.contains('Projecteur audio introuvable')) {
       return 'Le projecteur audio est absent. Retéléchargez le modèle voix.';
+    }
+    if (text.contains('modèle d’embeddings est absent')) {
+      return 'Le modèle de recherche est absent. Ajoutez une pièce jointe '
+          'pour le télécharger.';
+    }
+    if (text.contains('Le modèle d’embeddings n’est pas chargé')) {
+      return 'Le modèle de recherche n’est pas chargé.';
     }
     return text;
   }
@@ -945,6 +1288,17 @@ class _ChatPageState extends State<ChatPage> {
                     ? _cancelRecording
                     : (_synthesizing ? () => unawaited(_stopSpeaking()) : null),
               ),
+            if (_downloadingEmbedding)
+              _EmbeddingDownloadBanner(
+                received: _embeddingReceived,
+                total: _embeddingTotal,
+              ),
+            if (_ragLoading) const _RagLoadingBanner(),
+            if (_attachmentEntries.isNotEmpty)
+              _AttachmentBar(
+                entries: _attachmentEntries,
+                onRemove: (entry) => unawaited(_removeAttachment(entry)),
+              ),
             _Composer(
               controller: _input,
               generating: _generating,
@@ -953,6 +1307,8 @@ class _ChatPageState extends State<ChatPage> {
               recording: _recording,
               transcribing: _transcribing,
               onMic: _toggleRecording,
+              onAttach: _pickAttachments,
+              attaching: _downloadingEmbedding || _indexingAttachment,
               onSend: _send,
               onStop: _stop,
             ),
@@ -1267,6 +1623,8 @@ class _Composer extends StatelessWidget {
     required this.recording,
     required this.transcribing,
     required this.onMic,
+    required this.onAttach,
+    required this.attaching,
     required this.onSend,
     required this.onStop,
   });
@@ -1278,6 +1636,8 @@ class _Composer extends StatelessWidget {
   final bool recording;
   final bool transcribing;
   final VoidCallback onMic;
+  final VoidCallback onAttach;
+  final bool attaching;
   final VoidCallback onSend;
   final VoidCallback onStop;
 
@@ -1291,6 +1651,18 @@ class _Composer extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
+            IconButton(
+              onPressed: generating || attaching ? null : onAttach,
+              icon: attaching
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.attach_file),
+              tooltip: 'Ajouter des pièces jointes',
+              visualDensity: VisualDensity.compact,
+            ),
             if (showMic) ...[
               IconButton.filledTonal(
                 onPressed: generating || transcribing ? null : onMic,
@@ -1327,6 +1699,153 @@ class _Composer extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _AttachmentBar extends StatelessWidget {
+  const _AttachmentBar({required this.entries, required this.onRemove});
+
+  final List<_AttachmentEntry> entries;
+  final ValueChanged<_AttachmentEntry> onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      color: colors.surfaceContainerHigh,
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      child: Row(
+        children: [
+          Icon(Icons.attach_file, size: 16, color: colors.onSurfaceVariant),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final entry in entries)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: _AttachmentChip(
+                        entry: entry,
+                        onRemove: entry.status == _AttachmentStatus.indexing
+                            ? null
+                            : () => onRemove(entry),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AttachmentChip extends StatelessWidget {
+  const _AttachmentChip({required this.entry, this.onRemove});
+
+  final _AttachmentEntry entry;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final Widget avatar;
+    if (entry.status == _AttachmentStatus.indexing) {
+      avatar = const SizedBox(
+        width: 14,
+        height: 14,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    } else if (entry.status == _AttachmentStatus.error) {
+      avatar = Icon(Icons.error_outline, size: 16, color: colors.error);
+    } else {
+      avatar = Icon(switch (entry.kind) {
+        RagAttachmentKind.text => Icons.description_outlined,
+        RagAttachmentKind.image => Icons.image_outlined,
+        RagAttachmentKind.audio => Icons.audio_file_outlined,
+      }, size: 16);
+    }
+
+    return Tooltip(
+      message: entry.error ?? entry.statusText ?? entry.name,
+      child: InputChip(
+        avatar: avatar,
+        label: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 160),
+          child: Text(entry.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ),
+        onDeleted: onRemove,
+        deleteIcon: const Icon(Icons.close, size: 16),
+        visualDensity: VisualDensity.compact,
+      ),
+    );
+  }
+}
+
+class _EmbeddingDownloadBanner extends StatelessWidget {
+  const _EmbeddingDownloadBanner({required this.received, required this.total});
+
+  final int received;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final fraction = total > 0 ? (received / total).clamp(0.0, 1.0) : null;
+    return Container(
+      width: double.infinity,
+      color: colors.surfaceContainerHigh,
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.downloading, size: 18, color: colors.primary),
+              const SizedBox(width: 8),
+              const Expanded(child: Text('Téléchargement d’EmbeddingGemma-2…')),
+            ],
+          ),
+          const SizedBox(height: 6),
+          LinearProgressIndicator(value: fraction),
+          const SizedBox(height: 4),
+          Text(
+            '${_formatBytes(received)} / ${_formatBytes(total)}',
+            style: theme.textTheme.labelSmall,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RagLoadingBanner extends StatelessWidget {
+  const _RagLoadingBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      color: colors.surfaceContainerHigh,
+      padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 10),
+          const Expanded(child: Text('Chargement du modèle de recherche…')),
+        ],
       ),
     );
   }
@@ -1512,4 +2031,11 @@ String _formatTime(DateTime dateTime) {
 String _formatElapsed(int milliseconds) {
   if (milliseconds < 1000) return '$milliseconds ms';
   return '${(milliseconds / 1000).toStringAsFixed(1)} s';
+}
+
+String _formatBytes(int bytes) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} Go';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(0)} Mo';
 }
