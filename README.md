@@ -1,10 +1,10 @@
 # LFM3 Lab
 
-Application Flutter de démonstration pour exécuter **LFM3-1.7B** (texte) et **LFM3-Audio-2B** (voix) entièrement sur l'appareil, sans serveur.
+Application Flutter de démonstration pour exécuter **LFM3-1.7B** (texte), **LFM3-Audio-2B** (voix) et **EmbeddingGemma-2** (recherche) entièrement sur l'appareil, sans serveur.
 
 ## Fonctionnalités
 
-- Deux modèles au choix : `LFM3-1.7B · texte` (~1,1 Go) ou `LFM3-Audio-2B · voix` (~1,4 Go avec son projecteur).
+- Deux modèles de chat au choix : `LFM3-1.7B · texte` (~1,1 Go) ou `LFM3-Audio-2B · voix` (~1,4 Go avec son projecteur).
 - Téléchargement dans le stockage privé, avec reprise et progression.
 - Chat local en streaming avec `llamadart` (llama.cpp v0.8.0).
 - Rendu Markdown des réponses via `gpt_markdown`.
@@ -12,6 +12,10 @@ Application Flutter de démonstration pour exécuter **LFM3-1.7B** (texte) et **
 - Dictée vocale (ASR) et synthèse vocale (TTS) locales sur le modèle audio.
 - Lecture automatique des réponses (option persistante) et changement de modèle depuis le drawer.
 - Déchargement du modèle quand l'application passe en arrière-plan.
+- Pièces jointes locales : documents texte, images PNG/JPEG/WebP/BMP et audio WAV.
+- Indexation et recherche sémantique des pièces jointes avec `EmbeddingGemma-2` ; les extraits pertinents sont injectés dans le prompt.
+- Pièces jointes persistées par conversation, avec ajout, retrait et suppression automatique avec la conversation.
+- Téléchargement d'EmbeddingGemma-2 (~865 Mo) proposé à la première pièce jointe, après confirmation.
 
 ## Lancer
 
@@ -22,7 +26,9 @@ flutter run -d windows   # Windows
 flutter run -d <appareil> # Android
 ```
 
-Le modèle est téléchargé au premier lancement. Pour utiliser des fichiers locaux :
+Au lancement, l'application vérifie les modèles présents et affiche l'écran de téléchargement ; aucun téléchargement n'est lancé automatiquement. Le modèle de chat se télécharge depuis cet écran, et EmbeddingGemma-2 est proposé à la première pièce jointe. Les fichiers sont conservés dans le stockage privé de l'application.
+
+Pour utiliser des fichiers locaux :
 
 ```bash
 # Modèle texte
@@ -31,6 +37,11 @@ LFM3_MODEL_PATH=$PWD/models/LFM3-1.7B-Q4_K_M.gguf flutter run -d linux
 # Modèle audio (modèle + projecteur)
 LFM3_AUDIO_MODEL_PATH=$PWD/models/LFM3-Audio-2B-Q4_K_M.gguf \
 LFM3_AUDIO_PROJECTOR_PATH=$PWD/models/mmproj-LFM3-Audio-2B-Q8_0.gguf \
+flutter run -d linux
+
+# Modèle de recherche (EmbeddingGemma-2 + projecteur)
+EMBEDDINGGEMMA_MODEL_PATH=$PWD/models/embeddinggemma-2-Q8_0.gguf \
+EMBEDDINGGEMMA_PROJECTOR_PATH=$PWD/models/mmproj-embeddinggemma-2-Q8_0.gguf \
 flutter run -d linux
 ```
 
@@ -45,6 +56,14 @@ flutter test
 flutter build apk --debug
 flutter build linux --debug
 flutter build windows --debug
+```
+
+Le probe RAG réel vérifie l'indexation et la recherche texte/image/audio avec EmbeddingGemma-2 :
+
+```bash
+EMBEDDINGGEMMA_MODEL_PATH=$PWD/models/embeddinggemma-2-Q8_0.gguf \
+EMBEDDINGGEMMA_PROJECTOR_PATH=$PWD/models/mmproj-embeddinggemma-2-Q8_0.gguf \
+RUN_RAG_REAL=1 flutter test test/rag_real_probe_test.dart
 ```
 
 L'application Windows compilée se lance avec :
@@ -80,4 +99,4 @@ Le binaire `libggml-cpu.so` fourni par `llamadart` exige AVX2/FMA/BMI2. Sur un C
 
 ## Vie privée
 
-Le modèle et les conversations restent sur l'appareil. Aucune requête n'est envoyée pendant le chat.
+Les modèles, les conversations et les pièces jointes restent sur l'appareil. Aucune requête n'est envoyée pendant le chat, l'indexation ou la recherche.
